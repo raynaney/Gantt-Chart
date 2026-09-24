@@ -276,10 +276,8 @@
 .lg-root input.lg-num { text-align: right; padding-right: 2px; }
 .lg-root .lg-ro { padding: 0 6px; font-size: 12px; font-weight: 400; color: var(--lg-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .lg-root .lg-actions {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
+  /* sits beside the name (the input shrinks) rather than covering it */
+  flex: none;
   display: none;
   gap: 1px;
   padding: 1px;
@@ -302,6 +300,55 @@
   cursor: pointer;
 }
 .lg-root .lg-ibtn:hover { background: var(--lg-hover); color: var(--lg-text); }
+
+/* row drag & tree guides */
+.lg-root .lg-c-name.has-guides {
+  /* one faint vertical guide per level, lined up under each ancestor's caret */
+  background-image: repeating-linear-gradient(to right, transparent 0 7px, var(--lg-grid-strong) 7px 8px, transparent 8px 20px);
+  background-repeat: no-repeat;
+  background-position: 16px 0;
+}
+.lg-root .lg-grip {
+  position: absolute;
+  left: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 12px;
+  font-size: 12px;
+  line-height: 1;
+  text-align: center;
+  color: var(--lg-muted);
+  cursor: grab;
+  opacity: 0;
+  user-select: none;
+  touch-action: none;
+}
+.lg-root .lg-row:hover .lg-grip,
+.lg-root .lg-row.is-selected .lg-grip { opacity: 0.7; }
+.lg-root .lg-grip:hover { opacity: 1; color: var(--lg-text); }
+.lg-root .lg-row.is-dragging .lg-c,
+.lg-root .lg-row.is-dragging .lg-right > * { opacity: 0.35; }
+.lg-root .lg-drop-line {
+  position: absolute;
+  display: none;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--lg-accent);
+  box-shadow: 0 0 0 2px var(--lg-bg);
+  z-index: 40;
+  pointer-events: none;
+}
+.lg-root .lg-drop-line::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: -3px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid var(--lg-accent);
+  background: var(--lg-bg);
+}
 
 /* bars */
 .lg-root .lg-bar {
@@ -516,6 +563,26 @@
 .lg-root .lg-error { color: var(--lg-danger); font-size: 12px; min-height: 0; }
 .lg-root .lg-error:empty { display: none; }
 .lg-root .lg-modal-actions { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+
+/* export dialog */
+.lg-root .lg-modal.lg-modal-wide { width: min(980px, 100%); }
+.lg-root .lg-export-pane > .lg-field-row > .lg-field { flex: 0 1 auto; }
+.lg-root input.lg-input[type=range] { padding: 0; height: 32px; width: 140px; accent-color: var(--lg-accent); }
+.lg-root .lg-export-pane input.lg-input[type=number] { width: 110px; }
+.lg-root .lg-checks { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 12px; }
+.lg-root .lg-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer; }
+.lg-root .lg-check input { margin: 0; accent-color: var(--lg-accent); }
+.lg-root .lg-export-preview {
+  max-height: 46vh;
+  overflow: auto;
+  border: 1px solid var(--lg-border);
+  border-radius: 8px;
+  background: repeating-conic-gradient(var(--lg-bg-alt) 0% 25%, var(--lg-bg) 0% 50%) 0 0 / 16px 16px;
+}
+.lg-root canvas.lg-export-canvas { display: block; width: 100%; height: auto; cursor: zoom-in; }
+.lg-root canvas.lg-export-canvas[style*="width"] { max-width: none; cursor: zoom-out; }
+.lg-root .lg-export-hint { margin-top: 4px; font-size: 11px; color: var(--lg-muted); }
+.lg-root .lg-export-info { margin-top: 6px; font-size: 12px; color: var(--lg-muted); }
 
 @media print {
   .lg-root .lg-toolbar, .lg-root .lg-actions { display: none !important; }

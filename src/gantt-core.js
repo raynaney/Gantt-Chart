@@ -325,6 +325,7 @@ var LocalGantt = (function () {
       progress: col('% complete', 'percent complete', 'progress', '% done', 'complete'),
       preds: col('predecessors', 'dependencies'),
       res: col('resource names', 'resources', 'assignee', 'assigned to'),
+      hex: col('hex color', 'hex colour'),
       color: col('color', 'colour'),
       notes: col('notes', 'note', 'description'),
     };
@@ -350,7 +351,7 @@ var LocalGantt = (function () {
         progress: parseFloat(get(r, C.progress)) || 0,
         preds: get(r, C.preds),
         res: get(r, C.res),
-        color: csvColor(get(r, C.color)),
+        color: normColor(get(r, C.hex)) || csvColor(get(r, C.color)),
         notes: htmlToText(get(r, C.notes)),
       });
     }
@@ -400,6 +401,78 @@ var LocalGantt = (function () {
     const span = max - min;
     const zoom = span <= 45 ? 'day' : span <= 270 ? 'week' : span <= 1600 ? 'month' : 'quarter';
     return normalize({ version: 1, title: options.title || 'Imported plan', settings: { zoom, showColumns: true }, items, markers: [] });
+  }
+
+  // ---------------------------------------------------------------------------
+  // CSV export — the same columns onlinegantt.com uses, so files can go back
+  // there. Duration counts working days (Mon–Fri) like onlinegantt; Color is a
+  // hue (0–360) as onlinegantt expects, and "Hex Color" keeps the exact colour.
+  // ---------------------------------------------------------------------------
+  function workdays(s, e) {
+    let n = 0;
+    for (let d = s; d <= e; d++) { const wd = parts(d).wd; if (wd !== 0 && wd !== 6) n++; }
+    return n;
+  }
+  function hexToHue(hex) {
+    const r = parseInt(hex.slice(1, 3), 16) / 255, g = parseInt(hex.slice(3, 5), 16) / 255, b = parseInt(hex.slice(5, 7), 16) / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    if (!d) return 0;
+    let hue = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    hue *= 60;
+    return Math.round(hue < 0 ? hue + 360 : hue);
+  }
+  const escHtml = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const csvQ = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+
+  /** Depth-first rows of a (normalized) plan, with spans and progress. */
+  function planRows(d, includeCollapsed) {
+    const kids = new Map();
+    for (const it of d.items) { const k = it.parent || null; if (!kids.has(k)) kids.set(k, []); kids.get(k).push(it); }
+    const spans = new Map();
+    const span = (it) => {
+      if (spans.has(it.id)) return spans.get(it.id);
+      let out;
+      const ch = kids.get(it.id) || [];
+      if (it.type === 'project' && ch.length) {
+        let s = Infinity, e = -Infinity, tot = 0, done = 0;
+        for (const k of ch) {
+          const ks = span(k);
+          s = Math.min(s, ks.s); e = Math.max(e, ks.e); tot += ks.tot; done += ks.done;
+        }
+        out = { s, e, auto: true, tot, done, progress: tot ? Math.round((done / tot) * 100) : it.progress };
+      } else {
+        const s = toNum(it.start), e = it.type === 'milestone' ? s : toNum(it.end);
+        const len = it.type === 'task' ? e - s + 1 : 0;
+        out = { s, e, auto: false, tot: len, done: (len * it.progress) / 100, progress: it.progress };
+      }
+      spans.set(it.id, out);
+      return out;
+    };
+    const rows = [];
+    const walk = (parent, depth) => {
+      for (const it of kids.get(parent) || []) {
+        rows.push({ it, depth, span: span(it) });
+        if (it.type === 'project' && (includeCollapsed || !it.collapsed)) walk(it.id, depth + 1);
+      }
+    };
+    walk(null, 0);
+    return rows;
+  }
+
+  function toCsv(raw) {
+    const d = normalize(raw);
+    const head = ['Outline Level', 'ID', 'Name', 'Start', 'Finish', 'Duration', '% Complete', 'Predecessors', 'Resource Names', 'Color', 'Notes', 'Hex Color'];
+    const lines = [head.join(',')];
+    planRows(d, true).forEach((r, i) => {
+      const { it, span } = r;
+      const dur = it.type === 'milestone' ? 0 : workdays(span.s, span.e);
+      const notes = it.notes ? it.notes.split('\n').map((l) => `<p>${l ? escHtml(l) : '<br>'}</p>`).join('') : '<p><br></p>';
+      lines.push([
+        r.depth + 1, i + 1, csvQ(it.name), toStr(span.s), toStr(span.e), `${dur} day`,
+        Math.round(span.progress), csvQ(''), csvQ(''), hexToHue(it.color), csvQ(notes), it.color,
+      ].join(','));
+    });
+    return lines.join('\r\n') + '\r\n';
   }
 
   /** Parse a file's text as a plan: .gantt/.json, or CSV (by name or content). */
@@ -540,15 +613,147 @@ var LocalGantt = (function () {
       it.start = toStr(toNum(it.start) + dd);
       it.end = toStr(toNum(it.end) + dd);
     }
+    // ---- restructuring: reorder, indent, outdent, drag rows --------------------
+    const siblingsOf = (it) => data.items.filter((i) => i.parent === it.parent);
+
+    /** Move `it` under `parentId` (null = top level), just before sibling `before`, or last. */
+    function placeItem(it, parentId, before) {
+      data.items.splice(data.items.indexOf(it), 1);
+      it.parent = parentId;
+      let idx;
+      if (before) {
+        idx = data.items.indexOf(before);
+      } else {
+        const sibs = data.items.filter((i) => i.parent === parentId);
+        const anchor = sibs.length ? sibs[sibs.length - 1] : byId(parentId);
+        idx = anchor ? data.items.indexOf(anchor) + 1 : data.items.length;
+      }
+      data.items.splice(idx, 0, it);
+      for (let p = byId(parentId); p; p = byId(p.parent)) p.collapsed = false;
+    }
+    /** Tasks turn into projects when something is put inside them (like MS Project). */
+    function makeContainer(p) {
+      if (p && p.type === 'task') p.type = 'project';
+    }
+
     function moveItem(it, dir) {
-      const sibs = data.items.filter((i) => (i.parent || null) === (it.parent || null));
+      const sibs = siblingsOf(it);
       const other = sibs[sibs.indexOf(it) + dir];
-      if (!other) return;
+      if (!other) return notify(dir < 0 ? 'Already first in its group' : 'Already last in its group');
       mutate(() => {
         const a = data.items.indexOf(it), b = data.items.indexOf(other);
         data.items[a] = other;
         data.items[b] = it;
       });
+    }
+    function indentItem(it) {
+      const sibs = siblingsOf(it);
+      const prev = sibs[sibs.indexOf(it) - 1];
+      if (!prev) return notify('Nothing above to indent under');
+      if (prev.type === 'milestone') return notify('Can’t put items inside a milestone');
+      mutate(() => { makeContainer(prev); placeItem(it, prev.id, null); });
+    }
+    function outdentItem(it) {
+      const parent = byId(it.parent);
+      if (!parent) return notify('Already at the top level');
+      mutate(() => {
+        const sibs = data.items.filter((i) => i.parent === parent.parent);
+        placeItem(it, parent.parent, sibs[sibs.indexOf(parent) + 1] || null);
+      });
+    }
+
+    let notifyTimer = null;
+    function notify(text) {
+      tipEl.textContent = text;
+      tipEl.style.display = 'block';
+      tipEl.style.left = Math.max(8, (rootEl.clientWidth - tipEl.offsetWidth) / 2) + 'px';
+      tipEl.style.top = toolbarEl.offsetHeight + 8 + 'px';
+      clearTimeout(notifyTimer);
+      notifyTimer = setTimeout(hideTip, 1800);
+    }
+
+    /*
+     * Drag a row by its handle. Vertical position picks the gap between rows;
+     * horizontal movement picks the level (right = indent, left = outdent).
+     */
+    function dragRow(e, it) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      select(it.id);
+      const handle = e.currentTarget;
+      try { handle.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      rootEl.focus({ preventScroll: true });
+
+      const banned = new Set([it.id, ...descendantsOf(it.id).map((k) => k.id)]);
+      const all = visibleRows();
+      const startDepth = (all.find((r) => r.it === it) || { depth: 0 }).depth;
+      const rowEls = new Map([...scrollEl.querySelectorAll('.lg-row')].map((el) => [el.dataset.id, el]));
+      for (const id of banned) if (rowEls.get(id)) rowEls.get(id).classList.add('is-dragging');
+      const rows = all.filter((r) => !banned.has(r.it.id)).map((r) => Object.assign({ el: rowEls.get(r.it.id) }, r));
+      const body = scrollEl.querySelector('.lg-body');
+      const line = E('div', { class: 'lg-drop-line' });
+      body.append(line);
+      const x0 = e.clientX, y0 = e.clientY;
+      let moved = false;
+      let target = null;
+
+      const compute = (ev) => {
+        let g = 0;
+        for (const r of rows) { const b = r.el.getBoundingClientRect(); if (b.top + b.height / 2 < ev.clientY) g++; }
+        const A = rows[g - 1], B = rows[g];
+        const maxD = A ? A.depth + (A.it.type !== 'milestone' ? 1 : 0) : 0;
+        const minD = B ? B.depth : 0;
+        const d = clamp(startDepth + Math.round((ev.clientX - x0) / 20), minD, Math.max(minD, maxD));
+        let parentId, before;
+        if (A && d === A.depth + 1) {
+          parentId = A.it.id;
+          before = B && B.depth === d ? B.it : null;
+        } else {
+          let node = A ? A.it : null, nd = A ? A.depth : 0;
+          while (node && nd > d) { node = byId(node.parent); nd--; }
+          parentId = node ? node.parent : null;
+          if (B && B.depth === d) before = B.it;
+          else if (node) { const sibs = data.items.filter((i) => i.parent === parentId && !banned.has(i.id)); before = sibs[sibs.indexOf(node) + 1] || null; }
+          else before = null;
+        }
+        const bodyTop = body.getBoundingClientRect().top;
+        const y = B ? B.el.getBoundingClientRect().top : A ? A.el.getBoundingClientRect().bottom : bodyTop;
+        return { parentId, before, d, y: y - bodyTop };
+      };
+
+      const onMove = (ev) => {
+        if (!moved && Math.abs(ev.clientY - y0) < 4 && Math.abs(ev.clientX - x0) < 4) return;
+        moved = true;
+        // Auto-scroll near the top/bottom edge.
+        const sb = scrollEl.getBoundingClientRect();
+        if (ev.clientY < sb.top + HEAD_H + 20) scrollEl.scrollTop -= 12;
+        else if (ev.clientY > sb.bottom - 20) scrollEl.scrollTop += 12;
+        target = compute(ev);
+        const left = scrollEl.scrollLeft + 16 + target.d * 20;
+        line.style.display = 'block';
+        line.style.top = target.y - 1 + 'px';
+        line.style.left = left + 'px';
+        line.style.width = Math.max(40, scrollEl.clientWidth - (left - scrollEl.scrollLeft) - 8) + 'px';
+        const p = byId(target.parentId);
+        showTip(!p ? 'Top level'
+          : p.type === 'task' ? `Make “${p.name || 'Untitled'}” a project and put this inside`
+          : `Inside “${p.name || 'Untitled project'}”`, ev);
+      };
+      const onUp = (ev) => {
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        handle.removeEventListener('pointercancel', onUp);
+        hideTip();
+        line.remove();
+        for (const el of rowEls.values()) el.classList.remove('is-dragging');
+        if (!moved || !target || ev.type !== 'pointerup') return;
+        const { parentId, before } = target;
+        mutate(() => { makeContainer(byId(parentId)); placeItem(it, parentId, before); });
+      };
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onUp);
+      handle.addEventListener('pointercancel', onUp);
     }
     function removeItem(it) {
       mutate(() => {
@@ -698,6 +903,7 @@ var LocalGantt = (function () {
               { class: 'lg-btn' + (z === zoom ? ' is-active' : '') }))),
         E('div', { class: 'lg-group' },
           btn('Today', 'Scroll to today', () => scrollToDate(todayNum(), 0.3)),
+          btn('Export…', 'Export the chart as an image (PNG) or as CSV', () => openExportDialog()),
           btn(data.settings.showColumns ? 'Hide columns' : 'Show columns', 'Toggle the date / duration / progress columns',
             () => setSetting('showColumns', !data.settings.showColumns)),
           btn('↶', 'Undo (Ctrl/Cmd+Z)', undo, { disabled: !undoStack.length }),
@@ -807,7 +1013,14 @@ var LocalGantt = (function () {
         onkeydown: (e) => { if (e.key === 'Enter') e.target.blur(); },
       });
 
-      const name = E('div', { class: 'lg-c lg-c-name', style: { width: COLS.name + 'px', paddingLeft: 6 + depth * 20 + 'px' } });
+      const name = E('div', {
+        class: 'lg-c lg-c-name' + (depth ? ' has-guides' : ''),
+        style: { width: COLS.name + 'px', paddingLeft: 16 + depth * 20 + 'px', backgroundSize: depth * 20 + 'px 100%' },
+      });
+      name.append(E('span', {
+        class: 'lg-grip', title: 'Drag to reorder — move right to indent, left to outdent',
+        onpointerdown: (e) => dragRow(e, it),
+      }, '⠿'));
       if (it.type === 'project') {
         name.append(E('button', {
           type: 'button', class: 'lg-caret' + (it.collapsed ? ' is-collapsed' : ''),
@@ -831,8 +1044,10 @@ var LocalGantt = (function () {
           if (e.key === 'Escape') { e.target.value = it.name; e.target.blur(); }
         },
       }), E('div', { class: 'lg-actions' },
-        E('button', { type: 'button', class: 'lg-ibtn', title: 'Move up', onclick: () => moveItem(it, -1) }, '↑'),
-        E('button', { type: 'button', class: 'lg-ibtn', title: 'Move down', onclick: () => moveItem(it, 1) }, '↓'),
+        E('button', { type: 'button', class: 'lg-ibtn', title: 'Outdent (Shift+Tab)', onclick: () => outdentItem(it) }, '←'),
+        E('button', { type: 'button', class: 'lg-ibtn', title: 'Indent into the row above (Tab)', onclick: () => indentItem(it) }, '→'),
+        E('button', { type: 'button', class: 'lg-ibtn', title: 'Move up (Alt+↑)', onclick: () => moveItem(it, -1) }, '↑'),
+        E('button', { type: 'button', class: 'lg-ibtn', title: 'Move down (Alt+↓)', onclick: () => moveItem(it, 1) }, '↓'),
         E('button', { type: 'button', class: 'lg-ibtn', title: 'Edit details…', onclick: () => openItemDialog(it) }, '✎')));
       cell.append(name);
 
@@ -1033,6 +1248,7 @@ var LocalGantt = (function () {
     }
     function openModal(title, form) {
       closeModal();
+      form.noValidate = true; // inputs are validated in code; native checks (e.g. `step`) would silently block Save
       const modal = E('div', { class: 'lg-modal', role: 'dialog', 'aria-label': title }, E('h3', null, title), form);
       modalEl = E('div', { class: 'lg-backdrop' }, modal);
       modalEl.addEventListener('pointerdown', (e) => { if (e.target === modalEl) closeModal(); });
@@ -1043,7 +1259,9 @@ var LocalGantt = (function () {
     }
     const field = (label, input) => {
       const span = E('span', { class: 'lg-field-label' }, label);
-      const el = E('label', { class: 'lg-field' }, span, input);
+      // Only wrap real form controls in <label>; a label around buttons would "click" the first one.
+      const tag = /^(INPUT|SELECT|TEXTAREA)$/.test(input.tagName) ? 'label' : 'div';
+      const el = E(tag, { class: 'lg-field' }, span, input);
       el.labelEl = span;
       return el;
     };
@@ -1089,8 +1307,11 @@ var LocalGantt = (function () {
       const kids = descendantsOf(it.id).length;
 
       const name = inp('text', it.name, { placeholder: 'Name' });
-      const typeSel = isProj ? null : E('select', { class: 'lg-input' },
-        opt('task', 'Task', it.type), opt('milestone', 'Milestone', it.type));
+      // A project with items inside must stay a project; anything else can switch type.
+      const typeSel = isProj && kids
+        ? null
+        : E('select', { class: 'lg-input' },
+          opt('task', 'Task', it.type), opt('milestone', 'Milestone', it.type), opt('project', 'Project (group)', it.type));
       const banned = new Set([it.id, ...descendantsOf(it.id).map((k) => k.id)]);
       const parentSel = E('select', { class: 'lg-input' },
         opt('', '— none (top level) —', it.parent || ''),
@@ -1098,7 +1319,7 @@ var LocalGantt = (function () {
           .map((r) => opt(r.it.id, '\u00a0\u00a0'.repeat(r.depth) + (r.it.name || 'Untitled project'), it.parent || '')));
       const start = inp('date', it.start);
       const end = inp('date', it.end);
-      const progress = inp('number', String(it.progress), { min: '0', max: '100', step: '5' });
+      const progress = inp('number', String(it.progress), { min: '0', max: '100', step: '1' });
       const color = colorPicker(it.color);
       const deadline = isProj ? inp('date', it.deadline || '') : null;
       const dlColor = isProj ? colorPicker(it.deadlineColor) : null;
@@ -1154,7 +1375,7 @@ var LocalGantt = (function () {
             if (type !== 'milestone') it.progress = clamp(Math.round(Number(progress.value)) || 0, 0, 100);
           }
           it.color = color.get();
-          it.parent = parentSel.value || null;
+          if ((parentSel.value || null) !== it.parent) placeItem(it, parentSel.value || null, null);
           if (isProj) { it.deadline = d == null ? null : toStr(d); it.deadlineColor = dlColor.get(); }
           it.notes = notes.value;
         });
@@ -1193,6 +1414,441 @@ var LocalGantt = (function () {
       openModal(isNew ? 'Add marker' : 'Edit marker', form);
     }
 
+    // ---- export (PNG image / CSV) ----------------------------------------------
+    const IMG_FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+    const IMG_THEMES = {
+      light: { bg: '#ffffff', alt: '#f6f7f9', border: '#dde1e6', grid: '#eef0f3', text: '#1f2328', muted: '#6b7280', weekend: 'rgba(120,125,140,0.07)', today: '#e5484d' },
+      dark: { bg: '#17181b', alt: '#1f2125', border: '#34373d', grid: '#25272b', text: '#e6e7e9', muted: '#9aa0a8', weekend: 'rgba(255,255,255,0.035)', today: '#e5484d' },
+    };
+    const MAX_CANVAS = 16000; // per side, safely under browser limits
+
+    function saveBlob(filename, blob) {
+      if (opts.saveFile) return opts.saveFile(filename, blob);
+      const a = doc.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      doc.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      return Promise.resolve();
+    }
+    const baseName = () => (data.title || 'gantt').replace(/[\\/:*?"<>|#^[\]]+/g, '-').trim() || 'gantt';
+
+    function roundRect(ctx, x, y, w, h, r) {
+      r = Math.max(0, Math.min(r, w / 2, h / 2));
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+    function fitText(ctx, text, maxW) {
+      if (ctx.measureText(text).width <= maxW) return text;
+      let lo = 0, hi = text.length;
+      while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ctx.measureText(text.slice(0, mid) + '…').width <= maxW) lo = mid; else hi = mid - 1; }
+      return lo ? text.slice(0, lo) + '…' : '';
+    }
+
+    /** Everything needed to size and draw the image, derived from the export options. */
+    function imageLayout(o) {
+      const rows = planRows(data, o.expandAll);
+      const measure = doc.createElement('canvas').getContext('2d');
+      const rowH = o.rowH;
+      const fs = Math.round(clamp(rowH * 0.4, 11, 16));
+      const label = (it) => it.name || (it.type === 'project' ? 'Untitled project' : 'Untitled');
+
+      // Date range
+      let from, to;
+      if (o.range === 'custom' && toNum(o.from) != null && toNum(o.to) != null) {
+        from = Math.min(toNum(o.from), toNum(o.to)); to = Math.max(toNum(o.from), toNum(o.to));
+      } else {
+        from = Infinity; to = -Infinity;
+        for (const r of rows) {
+          from = Math.min(from, r.span.s); to = Math.max(to, r.span.e);
+          if (o.showMarkers && r.it.deadline) { from = Math.min(from, toNum(r.it.deadline)); to = Math.max(to, toNum(r.it.deadline)); }
+        }
+        if (o.showMarkers) for (const m of data.markers) { from = Math.min(from, toNum(m.date)); to = Math.max(to, toNum(m.date)); }
+        if (!Number.isFinite(from)) { from = todayNum(); to = from + 30; }
+        const padDays = Math.max(2, Math.round((to - from) * 0.02));
+        from -= padDays; to += padDays;
+      }
+      const days = to - from + 1;
+
+      // Left columns
+      let nameW = o.nameW;
+      if (!nameW) {
+        nameW = 160;
+        for (const r of rows) {
+          measure.font = `${r.it.type === 'project' ? 600 : 400} ${fs}px ${IMG_FONT}`;
+          nameW = Math.max(nameW, 16 + r.depth * 16 + 22 + measure.measureText(label(r.it)).width + 12);
+        }
+        nameW = Math.ceil(Math.min(nameW, 640));
+      }
+      const dateW = o.showDates ? Math.ceil(fs * 7.2) : 0;
+      const leftW = nameW + dateW * 2;
+      const titleH = o.showTitle ? Math.round(fs * 3.4) : 0;
+      const hasStrip = o.showMarkers && (data.markers.length > 0 || rows.some((r) => r.it.deadline));
+      const headH = 48 + (hasStrip || o.showToday ? 20 : 0);
+
+      // Timeline scale: user width, or the chart's current zoom. Leave room for
+      // labels that stick out past the last bar so nothing gets cut off.
+      measure.font = `${fs}px ${IMG_FONT}`;
+      const labelW = rows.map((r) => measure.measureText(label(r.it) + (r.it.type === 'project' ? '  100%' : '')).width + 12);
+      let pad = 16, dw2 = 1;
+      for (let pass = 0; pass < 4; pass++) {
+        dw2 = o.width ? Math.max(0.2, (o.width - leftW - pad) / days) : ZOOMS[data.settings.zoom].dw;
+        let overflow = 0;
+        rows.forEach((r, i) => {
+          const endX = (Math.min(r.span.e, to) - from + 1) * dw2;
+          const inside = r.it.type === 'task' && (r.span.e - r.span.s + 1) * dw2 > labelW[i] + 6;
+          if (!inside && r.span.e >= from && r.span.s <= to) overflow = Math.max(overflow, endX + (r.it.type === 'milestone' ? 12 : 0) + labelW[i] - days * dw2);
+        });
+        const nextPad = Math.max(16, Math.ceil(overflow) + 8);
+        if (nextPad === pad) break;
+        pad = nextPad;
+      }
+      const TW = days * dw2;
+      const W = Math.ceil(o.width || leftW + TW + pad);
+      const H = titleH + headH + rows.length * rowH + 1;
+      return { rows, from, to, days, dw: dw2, leftW, nameW, dateW, titleH, headH, rowH, fs, W, H, hasStrip, label };
+    }
+
+    function drawImage(o, L, canvas, scale) {
+      canvas.width = Math.max(1, Math.round(L.W * scale));
+      canvas.height = Math.max(1, Math.round(L.H * scale));
+      const ctx = canvas.getContext('2d');
+      const T = IMG_THEMES[o.theme] || IMG_THEMES.light;
+      const { rows, from, to, days, dw: pd, leftW, nameW, dateW, titleH, headH, rowH, fs, W, H } = L;
+      const X = (n) => leftW + (n - from) * pd;
+      const font = (weight, size) => `${weight} ${size}px ${IMG_FONT}`;
+      // Outline colours that would vanish into the background (e.g. white on the light theme).
+      const lum = (hex) => (0.299 * parseInt(hex.slice(1, 3), 16) + 0.587 * parseInt(hex.slice(3, 5), 16) + 0.114 * parseInt(hex.slice(5, 7), 16)) / 255;
+      const outline = (hex) => {
+        const l = lum(hex);
+        if (o.theme === 'dark' ? l > 0.12 : l < 0.85) return;
+        ctx.strokeStyle = o.theme === 'dark' ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.35)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      };
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = T.bg;
+      ctx.fillRect(0, 0, W, H);
+
+      // Title
+      if (titleH) {
+        ctx.fillStyle = T.text;
+        ctx.font = font(650, Math.round(fs * 1.45));
+        ctx.fillText(fitText(ctx, data.title || 'Untitled plan', W * 0.6), 16, titleH / 2);
+        ctx.fillStyle = T.muted;
+        ctx.font = font(400, fs);
+        ctx.textAlign = 'right';
+        ctx.fillText(`${fmtLong(from)} – ${fmtLong(to)}`, W - 16, titleH / 2);
+        ctx.textAlign = 'left';
+      }
+
+      // Time units: pick what fits the scale.
+      const kinds = pd >= 18 ? ['month', 'day'] : pd * 7 >= 46 ? ['month', 'week'] : pd * 30 >= 26 ? ['year', 'month'] : pd * 91 >= 24 ? ['year', 'quarter'] : [null, 'year'];
+      const unitsOf = (kind) => {
+        const out = [];
+        for (let n = unitStart(kind, from); n <= to; n = unitNext(kind, n)) out.push({ n, s: Math.max(n, from), e: Math.min(unitNext(kind, n), to + 1) });
+        return out;
+      };
+      const top = titleH, bodyTop = titleH + headH;
+      ctx.fillStyle = T.alt;
+      ctx.fillRect(0, top, leftW, headH);
+      ctx.save();
+      ctx.beginPath(); ctx.rect(leftW, 0, W - leftW, H); ctx.clip();
+      if (kinds[1] === 'day') {
+        ctx.fillStyle = T.weekend;
+        for (let n = from; n <= to; n++) if (isWeekend(n)) ctx.fillRect(X(n), top + 24, pd, H - top - 24);
+      }
+      ctx.fillStyle = T.grid;
+      for (const u of unitsOf(kinds[1])) ctx.fillRect(Math.round(X(u.s)), top + 24, 1, H - top - 24);
+      ctx.fillStyle = T.border;
+      if (kinds[0]) for (const u of unitsOf(kinds[0])) ctx.fillRect(Math.round(X(u.s)), top, 1, H - top);
+      const unitText = (kind, u, y, weight, color, isTop) => {
+        const w = (u.e - u.s) * pd;
+        ctx.font = font(weight, Math.round(fs * 0.85));
+        const t = fitText(ctx, unitLabel(kind, u.n, isTop), w - 8);
+        if (!t) return;
+        ctx.fillStyle = color;
+        ctx.fillText(t, X(u.s) + 5, y);
+      };
+      if (kinds[0]) for (const u of unitsOf(kinds[0])) unitText(kinds[0], u, top + 12, 650, T.text, true);
+      for (const u of unitsOf(kinds[1])) unitText(kinds[1], u, top + 36, 400, T.muted, false);
+      ctx.restore();
+
+      // Column headers
+      ctx.fillStyle = T.muted;
+      ctx.font = font(650, Math.round(fs * 0.78));
+      const hy = top + headH - 14;
+      ctx.fillText('NAME', 12, hy);
+      if (dateW) { ctx.fillText('START', nameW + 8, hy); ctx.fillText('END', nameW + dateW + 8, hy); }
+
+      // Row separators
+      ctx.fillStyle = T.grid;
+      for (let i = 0; i <= rows.length; i++) ctx.fillRect(0, bodyTop + i * rowH, W, 1);
+      ctx.fillStyle = T.border;
+      ctx.fillRect(0, bodyTop, W, 1);
+      ctx.fillRect(leftW, top, 1, H - top);
+
+      // Left column: names (+dates)
+      rows.forEach((r, i) => {
+        const y = bodyTop + i * rowH + rowH / 2;
+        const it = r.it;
+        const x0 = 12 + r.depth * 16;
+        ctx.fillStyle = it.color;
+        if (it.type === 'milestone') {
+          ctx.save(); ctx.translate(x0 + 6, y); ctx.rotate(Math.PI / 4); ctx.fillRect(-4.5, -4.5, 9, 9); ctx.restore();
+        } else if (it.type === 'project') {
+          ctx.beginPath(); ctx.arc(x0 + 6, y, 6, 0, Math.PI * 2); ctx.fill();
+        } else {
+          roundRect(ctx, x0, y - 6, 12, 12, 3); ctx.fill(); outline(it.color);
+        }
+        ctx.fillStyle = T.text;
+        ctx.font = font(it.type === 'project' ? 650 : 400, fs);
+        ctx.fillText(fitText(ctx, L.label(it), nameW - x0 - 24), x0 + 20, y);
+        if (dateW) {
+          ctx.fillStyle = T.muted;
+          ctx.font = font(400, Math.round(fs * 0.88));
+          ctx.fillText(fmtLong(r.span.s), nameW + 8, y);
+          if (it.type !== 'milestone') ctx.fillText(fmtLong(r.span.e), nameW + dateW + 8, y);
+        }
+      });
+
+      // Timeline: bars, milestones, deadlines
+      ctx.save();
+      ctx.beginPath(); ctx.rect(leftW + 1, bodyTop, W - leftW, H - bodyTop); ctx.clip();
+      const outLabel = (text, x, y, weight, right) => {
+        ctx.font = font(weight, fs);
+        const w = ctx.measureText(text).width;
+        ctx.fillStyle = T.text;
+        if (x + w > W - 4 && right - w - 6 > leftW + 2) { ctx.textAlign = 'right'; ctx.fillText(text, right - 6, y); ctx.textAlign = 'left'; }
+        else ctx.fillText(text, x, y);
+      };
+      rows.forEach((r, i) => {
+        const it = r.it, sp = r.span;
+        const yTop = bodyTop + i * rowH, y = yTop + rowH / 2;
+        const x = X(sp.s), w = Math.max(2, (sp.e - sp.s + 1) * pd);
+        if (sp.e < from || sp.s > to) return;
+        if (it.type === 'milestone') {
+          const sz = Math.min(rowH * 0.42, 14), cx = x + pd / 2;
+          ctx.save(); ctx.translate(cx, y); ctx.rotate(Math.PI / 4);
+          ctx.fillStyle = it.color; ctx.strokeStyle = T.bg; ctx.lineWidth = 2;
+          roundRect(ctx, -sz / 2, -sz / 2, sz, sz, 2); ctx.fill(); ctx.stroke();
+          ctx.restore();
+          outLabel(L.label(it), cx + sz * 0.75 + 4, y, 400, cx - sz * 0.75);
+        } else if (it.type === 'project') {
+          const bh = Math.max(6, rowH * 0.28), by = y - bh / 2 - 2;
+          ctx.fillStyle = it.color;
+          ctx.fillRect(x, by, w, bh);
+          ctx.beginPath(); ctx.moveTo(x, by + bh); ctx.lineTo(x + 6, by + bh); ctx.lineTo(x, by + bh + 6); ctx.closePath(); ctx.fill();
+          ctx.beginPath(); ctx.moveTo(x + w, by + bh); ctx.lineTo(x + w - 6, by + bh); ctx.lineTo(x + w, by + bh + 6); ctx.closePath(); ctx.fill();
+          if (sp.progress > 0) { ctx.fillStyle = 'rgba(0,0,0,0.28)'; ctx.fillRect(x, by, (w * sp.progress) / 100, bh); }
+          if (o.showMarkers && it.deadline) {
+            const dn = toNum(it.deadline), dx = X(dn + 1), late = sp.e > dn;
+            ctx.fillStyle = it.deadlineColor;
+            ctx.fillRect(dx - 1, yTop + 2, 2, rowH - 4);
+            ctx.font = font(650, Math.round(fs * 0.75));
+            const t = late ? '⚑ Late' : '⚑ ' + fmtShort(dn);
+            const tw = ctx.measureText(t).width + 8;
+            roundRect(ctx, dx, yTop + 2, tw, Math.round(fs * 1.1), 3); ctx.fill();
+            ctx.fillStyle = textOn(it.deadlineColor);
+            ctx.fillText(t, dx + 4, yTop + 2 + Math.round(fs * 0.55));
+          }
+          outLabel(L.label(it) + (sp.progress ? `  ${sp.progress}%` : ''), x + w + 6, y, 650, x);
+        } else {
+          const bh = Math.max(10, rowH * 0.62), by = y - bh / 2;
+          ctx.fillStyle = it.color;
+          roundRect(ctx, x, by, w, bh, Math.min(6, bh / 3)); ctx.fill(); outline(it.color);
+          if (sp.progress > 0) {
+            ctx.save(); roundRect(ctx, x, by, w, bh, Math.min(6, bh / 3)); ctx.clip();
+            ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.fillRect(x, by, (w * sp.progress) / 100, bh);
+            ctx.restore();
+          }
+          ctx.font = font(500, fs);
+          const lab = L.label(it);
+          if (ctx.measureText(lab).width + 16 <= w) {
+            ctx.fillStyle = textOn(it.color);
+            ctx.fillText(lab, Math.max(x, leftW) + 8, y);
+          } else {
+            outLabel(lab, x + w + 6, y, 400, x);
+          }
+        }
+      });
+
+      // Today line & markers on top
+      const stripY = top + 48;
+      const pill = (text, cx, bg, fg) => {
+        ctx.font = font(650, Math.round(fs * 0.75));
+        const tw = ctx.measureText(text).width + 12, ph = 15;
+        ctx.fillStyle = bg;
+        roundRect(ctx, cx - tw / 2, stripY + 2, tw, ph, ph / 2); ctx.fill();
+        ctx.fillStyle = fg;
+        ctx.textAlign = 'center'; ctx.fillText(text, cx, stripY + 2 + ph / 2); ctx.textAlign = 'left';
+      };
+      ctx.restore();
+      ctx.save();
+      ctx.beginPath(); ctx.rect(leftW + 1, top, W - leftW, H - top); ctx.clip();
+      const t = todayNum();
+      if (o.showToday && t >= from && t <= to) {
+        ctx.fillStyle = T.today; ctx.globalAlpha = 0.8;
+        ctx.fillRect(X(t) + pd / 2 - 1, stripY, 2, H - stripY);
+        ctx.globalAlpha = 1;
+        pill('Today', X(t) + pd / 2, T.today, '#ffffff');
+      }
+      if (o.showMarkers) {
+        for (const m of data.markers) {
+          const n = toNum(m.date);
+          if (n < from || n > to) continue;
+          const mx = X(n) + pd / 2;
+          ctx.strokeStyle = m.color; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+          ctx.beginPath(); ctx.moveTo(mx, stripY + 18); ctx.lineTo(mx, H); ctx.stroke();
+          ctx.setLineDash([]);
+          pill(m.name || 'Marker', mx, m.color, textOn(m.color));
+        }
+      }
+      ctx.restore();
+    }
+
+    function openExportDialog() {
+      const o = {
+        format: 'png', range: 'fit', from: '', to: '', width: 0, rowH: 30, nameW: 0,
+        showDates: data.settings.showColumns, showTitle: true, showToday: true, showMarkers: true,
+        expandAll: true, theme: 'light', scale: 2,
+      };
+      let L = imageLayout(o);
+      o.from = toStr(L.from); o.to = toStr(L.to);
+
+      let actual = false;
+      const preview = E('canvas', { class: 'lg-export-canvas', title: 'Click to toggle between fit and actual size' });
+      const previewHint = E('div', { class: 'lg-export-hint' });
+      preview.addEventListener('click', () => { actual = !actual; refresh(); });
+      const info = E('div', { class: 'lg-export-info' });
+      const error = E('div', { class: 'lg-error' });
+      const effScale = () => Math.max(0.5, Math.min(o.scale, MAX_CANVAS / L.W, MAX_CANVAS / L.H));
+      const refresh = () => {
+        L = imageLayout(o);
+        const sc = effScale();
+        const pw = Math.round(L.W * sc), ph = Math.round(L.H * sc);
+        info.textContent = `${L.W} × ${L.H} px` + (sc !== 1 ? ` at ${+sc.toFixed(2)}× → ${pw} × ${ph} px` : '')
+          + (sc < o.scale ? ' (resolution reduced to stay within the browser’s image size limit)' : '')
+          + ` · ${L.rows.length} rows · ${fmtLong(L.from)} – ${fmtLong(L.to)}`;
+        // "Fit" draws a small preview; "actual size" draws 1:1 (scrollable).
+        if (actual) {
+          const sc1 = Math.min(1, MAX_CANVAS / L.W, MAX_CANVAS / L.H);
+          drawImage(o, L, preview, sc1);
+          preview.style.width = L.W + 'px';
+        } else {
+          drawImage(o, L, preview, Math.min(1.5, 2400 / L.W, 2400 / L.H));
+          preview.style.width = '';
+        }
+        previewHint.textContent = actual ? 'Actual size — click to fit' : 'Preview — click to see actual size';
+      };
+      const bind = (el, key, conv) => {
+        el.addEventListener(el.type === 'checkbox' ? 'change' : 'input', () => { o[key] = conv ? conv(el) : el.value; refresh(); });
+        return el;
+      };
+      const num = (el) => Math.max(0, Math.round(Number(el.value) || 0));
+      const check = (key, label) => E('label', { class: 'lg-check' }, bind(E('input', { type: 'checkbox', checked: o[key] }), key, (el) => el.checked), ' ', label);
+      const seg = (key, choices) => {
+        const wrap = E('div', { class: 'lg-seg lg-group' });
+        const paint = () => { for (const b of wrap.children) b.classList.toggle('is-active', String(o[key]) === b.dataset.v); };
+        for (const [v, label] of choices) {
+          wrap.append(E('button', { type: 'button', class: 'lg-btn', 'data-v': String(v), onclick: () => { o[key] = v; paint(); onSeg(key); } }, label));
+        }
+        paint();
+        return wrap;
+      };
+
+      const widthIn = inp('number', '', { min: '300', max: String(MAX_CANVAS), step: '10', placeholder: 'Auto' });
+      const setWidth = (w) => { o.width = w; widthIn.value = w ? String(w) : ''; refresh(); };
+      bind(widthIn, 'width', (el) => { const v = num(el); return v && v < 300 ? 300 : Math.min(v, MAX_CANVAS); });
+      const fromIn = bind(inp('date', o.from), 'from');
+      const toIn = bind(inp('date', o.to), 'to');
+      const customRow = E('div', { class: 'lg-field-row' }, field('From', fromIn), field('To', toIn));
+      const rowIn = bind(inp('range', String(o.rowH), { min: '18', max: '56', step: '2' }), 'rowH', num);
+      const nameIn = bind(inp('number', '', { min: '80', max: '900', step: '10', placeholder: 'Auto (fits longest name)' }), 'nameW', num);
+
+      const pngPane = E('div', { class: 'lg-export-pane' },
+        E('div', { class: 'lg-field-row' },
+          field('Dates shown', seg('range', [['fit', 'Fit all items'], ['custom', 'Custom range']])),
+          field('Theme', seg('theme', [['light', 'Light'], ['dark', 'Dark']])),
+          field('Resolution', seg('scale', [[1, '1×'], [2, '2×'], [3, '3×']]))),
+        customRow,
+        E('div', { class: 'lg-field-row' },
+          field('Image width (px)', E('div', { class: 'lg-inline' }, widthIn,
+            E('button', { type: 'button', class: 'lg-btn', title: 'Same horizontal scale as the chart view', onclick: () => setWidth(0) }, 'Auto'),
+            E('button', { type: 'button', class: 'lg-btn', title: 'Fit on a typical slide/screen', onclick: () => setWidth(1920) }, '1920'),
+            E('button', { type: 'button', class: 'lg-btn', onclick: () => setWidth(3000) }, '3000'))),
+          field('Row height', rowIn),
+          field('Name column (px)', nameIn)),
+        E('div', { class: 'lg-checks' },
+          check('showDates', 'Start/end columns'), check('showTitle', 'Title'), check('showToday', 'Today line'),
+          check('showMarkers', 'Markers & deadlines'), check('expandAll', 'Include collapsed rows')),
+        E('div', { class: 'lg-export-preview' }, preview), previewHint,
+        info);
+      const csvPane = E('div', { class: 'lg-export-pane' },
+        E('div', { class: 'lg-note' },
+          'Exports every row in the onlinegantt.com CSV format (Outline Level, ID, Name, Start, Finish, Duration, % Complete, …), ',
+          'so it can be imported back into onlinegantt, opened in Excel/Sheets, or re-imported here. ',
+          'Duration is in working days. Colours are written as a hue (for onlinegantt) plus an exact “Hex Color” column. ',
+          'Markers and project deadlines have no CSV equivalent and are left out.'));
+
+      const primary = E('button', { type: 'submit', class: 'lg-btn lg-btn-primary' }, 'Save PNG');
+      const copyBtn = E('button', {
+        type: 'button', class: 'lg-btn', title: 'Copy the image to the clipboard',
+        onclick: () => withImage((blob) => {
+          const Item = win.ClipboardItem;
+          if (!Item || !win.navigator.clipboard) throw new Error('Copying images isn’t supported here — use Save PNG.');
+          return win.navigator.clipboard.write([new Item({ 'image/png': blob })]).then(() => notify('Image copied to clipboard'));
+        }),
+      }, 'Copy image');
+      const syncFormat = () => {
+        pngPane.style.display = o.format === 'png' ? '' : 'none';
+        csvPane.style.display = o.format === 'csv' ? '' : 'none';
+        copyBtn.style.display = o.format === 'png' ? '' : 'none';
+        primary.textContent = o.format === 'png' ? 'Save PNG' : 'Save CSV';
+      };
+      const onSeg = (key) => {
+        if (key === 'format') syncFormat();
+        else if (key === 'range') { customRow.style.display = o.range === 'custom' ? '' : 'none'; refresh(); }
+        else refresh();
+      };
+
+      function withImage(fn) {
+        error.textContent = '';
+        const c = doc.createElement('canvas');
+        drawImage(o, L, c, effScale());
+        return new Promise((res) => c.toBlob(res, 'image/png'))
+          .then((blob) => { if (!blob) throw new Error('The image is too large — lower the width or resolution.'); return fn(blob); })
+          .catch((e) => { error.textContent = e.message || String(e); });
+      }
+      const save = () => {
+        if (o.format === 'csv') {
+          saveBlob(baseName() + '.csv', new win.Blob([toCsv(data)], { type: 'text/csv' }));
+          closeModal();
+          return;
+        }
+        withImage((blob) => Promise.resolve(saveBlob(baseName() + '.png', blob)).then(() => closeModal()));
+      };
+
+      const form = E('form', { class: 'lg-form', onsubmit: (e) => { e.preventDefault(); save(); } },
+        field('Format', seg('format', [['png', 'Image (PNG)'], ['csv', 'CSV (onlinegantt)']])),
+        pngPane, csvPane, error,
+        E('div', { class: 'lg-modal-actions' }, E('div', { class: 'lg-spacer' }),
+          E('button', { type: 'button', class: 'lg-btn', onclick: closeModal }, 'Cancel'), copyBtn, primary));
+      openModal('Export', form);
+      modalEl.firstChild.classList.add('lg-modal-wide');
+      customRow.style.display = 'none';
+      syncFormat();
+      refresh();
+    }
+
     // ---- keyboard & resize --------------------------------------------------------
     rootEl.addEventListener('keydown', (e) => {
       if (modalEl) return;
@@ -1200,6 +1856,12 @@ var LocalGantt = (function () {
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       const mod = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
+      const sel = byId(selectedId);
+      if (sel && e.key === 'Tab') { e.preventDefault(); if (e.shiftKey) outdentItem(sel); else indentItem(sel); return; }
+      if (sel && e.altKey && e.key === 'ArrowUp') { e.preventDefault(); moveItem(sel, -1); return; }
+      if (sel && e.altKey && e.key === 'ArrowDown') { e.preventDefault(); moveItem(sel, 1); return; }
+      if (sel && e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); outdentItem(sel); return; }
+      if (sel && e.altKey && e.key === 'ArrowRight') { e.preventDefault(); indentItem(sel); return; }
       if (mod && key === 'z') { e.preventDefault(); e.stopPropagation(); if (e.shiftKey) redo(); else undo(); }
       else if (mod && key === 'y') { e.preventDefault(); e.stopPropagation(); redo(); }
       else if ((e.key === 'Delete' || e.key === 'Backspace') && byId(selectedId)) { e.preventDefault(); removeItem(byId(selectedId)); }
@@ -1229,7 +1891,7 @@ var LocalGantt = (function () {
     };
   }
 
-  return { create, normalize, fromCsv, parseFile, sampleData, starterData, blankData, PALETTE };
+  return { create, normalize, fromCsv, toCsv, parseFile, sampleData, starterData, blankData, PALETTE };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports.LocalGantt = LocalGantt;
