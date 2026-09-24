@@ -19,6 +19,9 @@ A local, offline Gantt chart app inspired by onlinegantt.com. It comes in two fo
 - **Set dates yourself**: edit Start, End, Days and % right in the table, or click a bar (or ✎) for the full edit dialog with notes.
 - **Nested projects**: projects can sit inside other projects, as many levels deep as you like. Use "Inside project" in the edit dialog to move any row.
 - **CSV import**: bring in a CSV export from onlinegantt.com (see below).
+- **Reorganise by dragging**: hover a row and drag the ⠿ handle to move it up or down. Drag right to put it inside the row above, or left to move it out of its project. A blue line shows where it will land, and a label names the project it will go into. Dropping onto a task turns that task into a project.
+- **Indent and outdent**: use the ← → ↑ ↓ buttons that appear when you hover a row. With a row selected, Tab and Shift+Tab indent and outdent it, and Alt+arrow keys do the same. In the edit dialog, Type can switch a task to a project.
+- **Export**: click **Export…** for a PNG image or a CSV (see below).
 - Reorder rows with ↑ / ↓. Undo and redo with Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z. Press Delete to remove the selected row and Enter to edit it.
 - Light and dark themes. Inside Obsidian it follows your Obsidian theme.
 
@@ -66,6 +69,22 @@ How the columns are mapped:
 - **Notes** HTML is turned into plain text.
 - **Predecessors** (for example `13FS+28 days`) and **Resource Names** are added to each task's notes as readable text. Dependency arrows aren't drawn.
 - Only **Name** and **Start** are required, so simpler CSVs work too. Semicolon- or tab-separated files are also accepted.
+
+## Export (image or CSV)
+
+Click **Export…** in the toolbar.
+
+- **Image (PNG)**: a live preview shows the result. Click the preview to switch between fit-to-width and actual size. You can change:
+  - **Dates shown**: fit all items, or a custom range.
+  - **Image width**: Auto uses the same scale as the chart view. 1920 and 3000 are presets, or type any width. The date axis switches between days, weeks, months and quarters to suit the width.
+  - **Row height** and **name column width**. The name column defaults to fitting the longest name, so nothing gets cut off.
+  - **Resolution** (1×, 2× or 3×) and **theme** (light or dark).
+  - Whether to show the start/end columns, title, today line, markers and deadlines, and collapsed rows.
+
+  Labels are placed so they stay inside the image. **Copy image** puts the picture on the clipboard.
+- **CSV (onlinegantt)**: uses the same columns as the import, so it can go back into onlinegantt.com or into Excel or Sheets. Duration is counted in working days, as onlinegantt does. An extra **Hex Color** column keeps exact colours for re-importing here. Markers and project deadlines are not included.
+
+In Obsidian, exports are saved next to the chart in your vault, and the PNG opens in a new tab. The standalone page downloads them.
 
 ## Use it without Obsidian
 

@@ -9,6 +9,18 @@ const ICON = 'calendar-range';
 
 const toJson = (d) => JSON.stringify(d, null, 2);
 
+/** Save an exported file (PNG/CSV) next to `file` in the vault and open it. */
+async function saveExport(app, file, name, blob) {
+  const dir = file && file.parent && !file.parent.isRoot() ? file.parent.path + '/' : '';
+  const dot = name.lastIndexOf('.');
+  const stem = name.slice(0, dot), ext = name.slice(dot);
+  let path = obsidian.normalizePath(dir + name);
+  for (let i = 1; app.vault.getAbstractFileByPath(path); i++) path = obsidian.normalizePath(`${dir}${stem} ${i}${ext}`);
+  const created = await app.vault.createBinary(path, await blob.arrayBuffer());
+  new obsidian.Notice(`Exported ${created.path}`);
+  if (ext === '.png') await app.workspace.getLeaf('tab').openFile(created);
+}
+
 /** Full-tab editor for *.gantt files (JSON). */
 class GanttView extends obsidian.TextFileView {
   constructor(leaf) {
@@ -62,6 +74,7 @@ class GanttView extends obsidian.TextFileView {
         this.raw = toJson(d);
         this.requestSave();
       },
+      saveFile: (name, blob) => saveExport(this.app, this.file, name, blob),
     });
   }
 
@@ -111,6 +124,7 @@ class GanttEmbed extends obsidian.MarkdownRenderChild {
       data: parsed,
       className: 'lg-obsidian',
       onChange: (d) => this.queueSave(d),
+      saveFile: (name, blob) => saveExport(this.plugin.app, this.file, name, blob),
       toolbarExtras: [{
         label: 'Open in tab',
         title: `Open ${this.file.path} in its own tab`,
