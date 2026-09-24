@@ -153,28 +153,64 @@ class LocalGanttPlugin extends obsidian.Plugin {
     this.addCommand({ id: 'create-gantt-chart', name: 'Create new Gantt chart', callback: () => this.createChart() });
     this.addCommand({ id: 'create-example-gantt-chart', name: 'Create example Gantt chart', callback: () => this.createChart(null, true) });
 
+    this.addCommand({ id: 'import-csv', name: 'Import Gantt chart from CSV file…', callback: () => this.importCsvFromDisk() });
+
     this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
-      if (!(file instanceof obsidian.TFolder)) return;
-      menu.addItem((item) => item.setTitle('New Gantt chart').setIcon(ICON).onClick(() => this.createChart(file)));
+      if (file instanceof obsidian.TFolder) {
+        menu.addItem((item) => item.setTitle('New Gantt chart').setIcon(ICON).onClick(() => this.createChart(file)));
+      } else if (file instanceof obsidian.TFile && file.extension.toLowerCase() === 'csv') {
+        menu.addItem((item) => item.setTitle('Convert to Gantt chart').setIcon(ICON).onClick(async () => {
+          await this.importCsvText(await this.app.vault.read(file), file.name, file.parent);
+        }));
+      }
     }));
 
     this.registerMarkdownCodeBlockProcessor('gantt', (source, el, ctx) => this.renderCodeBlock(source, el, ctx));
   }
 
   async createChart(folder, example) {
+    await this.createChartFile(example ? 'Example Gantt chart' : 'Gantt chart',
+      example ? LocalGantt.sampleData() : LocalGantt.starterData(), folder);
+  }
+
+  async createChartFile(baseName, data, folder) {
     const vault = this.app.vault;
     if (!folder) {
       const active = this.app.workspace.getActiveFile();
       folder = this.app.fileManager.getNewFileParent(active ? active.path : '');
     }
     const dir = !folder || folder.isRoot() ? '' : folder.path + '/';
-    const base = example ? 'Example Gantt chart' : 'Gantt chart';
+    const base = baseName.replace(/[\\/:*?"<>|#^[\]]+/g, '-').trim() || 'Gantt chart';
     let path = obsidian.normalizePath(`${dir}${base}.${EXTENSION}`);
     for (let i = 1; vault.getAbstractFileByPath(path); i++) path = obsidian.normalizePath(`${dir}${base} ${i}.${EXTENSION}`);
-    const data = example ? LocalGantt.sampleData() : LocalGantt.starterData();
     const file = await vault.create(path, toJson(data));
     await this.app.workspace.getLeaf('tab').openFile(file);
     new obsidian.Notice(`Created ${file.path}`);
+    return file;
+  }
+
+  /** Turn CSV text (e.g. an onlinegantt.com export) into a new .gantt file. */
+  async importCsvText(text, fileName, folder) {
+    let data;
+    try {
+      data = LocalGantt.fromCsv(text, { title: fileName.replace(/\.[^.]+$/, '').replace(/_/g, ' ') });
+    } catch (e) {
+      new obsidian.Notice(`Could not import ${fileName}: ${e.message}`, 8000);
+      return null;
+    }
+    return this.createChartFile(fileName.replace(/\.[^.]+$/, ''), data, folder);
+  }
+
+  /** Pick a CSV file from the computer and import it. */
+  importCsvFromDisk() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.csv,text/csv';
+    input.onchange = async () => {
+      const file = input.files && input.files[0];
+      if (file) await this.importCsvText(await file.text(), file.name);
+    };
+    input.click();
   }
 
   /*

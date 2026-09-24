@@ -17,6 +17,8 @@ A local, offline Gantt chart app inspired by onlinegantt.com. It comes in two fo
 - **Markers**: vertical lines across the whole chart for hard deadlines, reviews, holidays and so on. Drag the label to move one, click it to edit.
 - **Custom colours** for everything: pick from the palette or any colour you like, from the swatch in the table or in the edit dialog.
 - **Set dates yourself**: edit Start, End, Days and % right in the table, or click a bar (or ✎) for the full edit dialog with notes.
+- **Nested projects**: projects can sit inside other projects, as many levels deep as you like. Use "Inside project" in the edit dialog to move any row.
+- **CSV import**: bring in a CSV export from onlinegantt.com (see below).
 - Reorder rows with ↑ / ↓. Undo and redo with Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z. Press Delete to remove the selected row and Enter to edit it.
 - Light and dark themes. Inside Obsidian it follows your Obsidian theme.
 
@@ -44,12 +46,33 @@ height: 450
 
 The embedded chart is fully editable, and your changes are saved to the `.gantt` file. You can also write a `[[Launch]]`-style link on its own line instead of `file:`.
 
+## Import from CSV (onlinegantt.com export)
+
+The importer reads CSV exports with these columns:
+
+```
+Outline Level,ID,Name,Start,Finish,Duration,% Complete,Predecessors,Resource Names,Color,Notes
+```
+
+- **Obsidian**: run **"Local Gantt: Import Gantt chart from CSV file…"** and pick the file. The chart opens as a new `.gantt` file named after the CSV. If the CSV is already in your vault, you can instead right-click it and choose **Convert to Gantt chart** (Obsidian only lists `.csv` files when *Settings → Files & links → Detect all file extensions* is on).
+- **Standalone**: click **Import CSV…** (or **Open…**), or drag the file onto the page. This replaces the current plan, and Ctrl/Cmd+Z brings the old one back.
+
+How the columns are mapped:
+- **Outline Level** sets the nesting. A row followed by deeper rows becomes a project.
+- Rows with a duration of `0 day` become milestones.
+- **Start** and **Finish** set the dates. Finish is included in the task. The **Days** column in the app counts calendar days, whereas onlinegantt's Duration counts working days, so the numbers will differ.
+- **Color** values are hues (0–360) and are converted to colours. Rows with no colour take their parent project's colour.
+- **% Complete** becomes the progress.
+- **Notes** HTML is turned into plain text.
+- **Predecessors** (for example `13FS+28 days`) and **Resource Names** are added to each task's notes as readable text. Dependency arrows aren't drawn.
+- Only **Name** and **Start** are required, so simpler CSVs work too. Semicolon- or tab-separated files are also accepted.
+
 ## Use it without Obsidian
 
 Open `standalone/local-gantt.html` in a browser. Your plan saves automatically in that browser.
 
 - **Save…** downloads a `.gantt` file.
-- **Open…** loads a `.gantt` file.
+- **Open…** loads a `.gantt` or `.csv` file.
 - **Print** prints the chart or saves it as a PDF.
 
 The `.gantt` files work in both the standalone page and the Obsidian plugin.
