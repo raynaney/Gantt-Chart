@@ -131,8 +131,8 @@ var LocalGantt = (function () {
   //     items: [{id, type: project|task|milestone, name, start, end, color,
   //              progress, parent, deadline, deadlineColor, collapsed, notes}],
   //     markers: [{id, name, date, color}] }
-  // Tasks/milestones may belong to a project via `parent`. A project that has
-  // children spans them automatically; its own start/end are only used when empty.
+  // Any item may belong to a project via `parent` (projects can nest). A project
+  // with children spans them automatically; its own start/end are only used when empty.
   // ---------------------------------------------------------------------------
   function blankData() {
     return { version: 1, title: 'Untitled plan', settings: { zoom: 'week', showColumns: true }, items: [], markers: [] };
@@ -209,9 +209,16 @@ var LocalGantt = (function () {
         notes: typeof it.notes === 'string' ? it.notes : '',
       });
     }
-    // Only one level of nesting: projects are top level, children must point at a project.
-    const projects = new Set(out.items.filter((i) => i.type === 'project').map((i) => i.id));
-    for (const it of out.items) if (it.type === 'project' || !projects.has(it.parent)) it.parent = null;
+    // Parents must be projects, and the hierarchy must not loop.
+    const projects = new Map(out.items.filter((i) => i.type === 'project').map((i) => [i.id, i]));
+    for (const it of out.items) if (!projects.has(it.parent) || it.parent === it.id) it.parent = null;
+    for (const it of out.items) {
+      const seen = new Set([it.id]);
+      for (let p = projects.get(it.parent); p; p = projects.get(p.parent)) {
+        if (seen.has(p.id)) { it.parent = null; break; }
+        seen.add(p.id);
+      }
+    }
 
     for (const m of Array.isArray(d.markers) ? d.markers : []) {
       if (!m || typeof m !== 'object' || toNum(m.date) == null) continue;
@@ -223,6 +230,185 @@ var LocalGantt = (function () {
       });
     }
     return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // CSV import — onlinegantt.com exports (and similar MS Project-style CSVs):
+  //   Outline Level,ID,Name,Start,Finish,Duration,% Complete,Predecessors,
+  //   Resource Names,Color,Notes
+  // A row followed by deeper rows becomes a project; "0 day" rows become
+  // milestones; numeric colours are hues (0-360).
+  // ---------------------------------------------------------------------------
+  function parseCsv(text, delim) {
+    const rows = [];
+    let row = [], field = '', quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quoted) {
+        if (c !== '"') field += c;
+        else if (text[i + 1] === '"') { field += '"'; i++; }
+        else quoted = false;
+      } else if (c === '"') quoted = true;
+      else if (c === delim) { row.push(field); field = ''; }
+      else if (c === '\n' || c === '\r') {
+        if (c === '\r' && text[i + 1] === '\n') i++;
+        row.push(field); rows.push(row); row = []; field = '';
+      } else field += c;
+    }
+    if (field !== '' || row.length) { row.push(field); rows.push(row); }
+    return rows.filter((r) => r.some((f) => f.trim() !== ''));
+  }
+
+  function parseDateLoose(s) {
+    s = String(s || '').trim();
+    if (!s) return null;
+    const ymd = (y, m, d) => (m >= 1 && m <= 12 && d >= 1 && d <= 31 ? Date.UTC(y, m - 1, d) / DAY_MS : null);
+    let m = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/.exec(s);
+    if (m) return ymd(+m[1], +m[2], +m[3]);
+    m = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})/.exec(s);
+    if (m) return +m[1] > 12 ? ymd(+m[3], +m[2], +m[1]) : ymd(+m[3], +m[1], +m[2]); // M/D/Y unless clearly D/M/Y
+    const t = Date.parse(s);
+    if (Number.isNaN(t)) return null;
+    const d = new Date(t);
+    return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / DAY_MS;
+  }
+
+  function hslToHex(hue, sat, light) {
+    const s = sat / 100, l = light / 100;
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => {
+      const k = (n + hue / 30) % 12;
+      const v = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+      return Math.round(v * 255).toString(16).padStart(2, '0');
+    };
+    return '#' + f(0) + f(8) + f(4);
+  }
+  function csvColor(v) {
+    const t = String(v || '').trim();
+    if (!t) return null;
+    if (/^\d+(\.\d+)?$/.test(t)) return hslToHex(Number(t) % 360, 62, 52); // hue in degrees
+    return normColor(t);
+  }
+
+  function htmlToText(s) {
+    return String(s || '')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|div|li|h\d)>/gi, '\n')
+      .replace(/<li[^>]*>/gi, '• ')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+      .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  const DEP_TYPES = { FS: 'finish-to-start', SS: 'start-to-start', FF: 'finish-to-finish', SF: 'start-to-finish' };
+
+  function fromCsv(text, options) {
+    options = options || {};
+    text = String(text || '').replace(/^﻿/, '');
+    const first = text.split(/\r?\n/, 1)[0] || '';
+    const count = (ch) => first.split(ch).length - 1;
+    const delim = count('\t') > count(',') && count('\t') > count(';') ? '\t' : count(';') > count(',') ? ';' : ',';
+    const rows = parseCsv(text, delim);
+    if (!rows.length) throw new Error('The CSV file is empty.');
+
+    const head = rows[0].map((x) => x.trim().toLowerCase().replace(/\s+/g, ' '));
+    const col = (...names) => { for (const n of names) { const i = head.indexOf(n); if (i >= 0) return i; } return -1; };
+    const C = {
+      level: col('outline level', 'level', 'wbs level'),
+      id: col('id', 'task id', 'unique id'),
+      name: col('name', 'task name', 'task', 'title'),
+      start: col('start', 'start date', 'begin'),
+      end: col('finish', 'end', 'finish date', 'end date', 'due', 'due date'),
+      duration: col('duration'),
+      progress: col('% complete', 'percent complete', 'progress', '% done', 'complete'),
+      preds: col('predecessors', 'dependencies'),
+      res: col('resource names', 'resources', 'assignee', 'assigned to'),
+      color: col('color', 'colour'),
+      notes: col('notes', 'note', 'description'),
+    };
+    if (C.name < 0 || C.start < 0) {
+      throw new Error('This CSV needs at least a “Name” and a “Start” column (found: ' + rows[0].join(', ') + ').');
+    }
+    const get = (r, i) => (i >= 0 && i < r.length ? r[i].trim() : '');
+
+    const recs = [];
+    for (const r of rows.slice(1)) {
+      const name = get(r, C.name);
+      let s = parseDateLoose(get(r, C.start));
+      let e = parseDateLoose(get(r, C.end));
+      if (!name && s == null && e == null) continue;
+      if (s == null) s = e != null ? e : todayNum();
+      if (e == null || e < s) e = s;
+      const dur = get(r, C.duration);
+      recs.push({
+        level: Math.max(1, parseInt(get(r, C.level), 10) || 1),
+        srcId: get(r, C.id),
+        name, s, e,
+        milestone: dur !== '' && parseFloat(dur) === 0,
+        progress: parseFloat(get(r, C.progress)) || 0,
+        preds: get(r, C.preds),
+        res: get(r, C.res),
+        color: csvColor(get(r, C.color)),
+        notes: htmlToText(get(r, C.notes)),
+      });
+    }
+    if (!recs.length) throw new Error('No tasks were found in this CSV.');
+
+    // Rebuild the hierarchy from outline levels.
+    const items = [];
+    const stack = [];
+    const bySrcId = new Map();
+    recs.forEach((r, i) => {
+      while (stack.length && stack[stack.length - 1].level >= r.level) stack.pop();
+      const parent = stack.length ? stack[stack.length - 1] : null;
+      const type = i + 1 < recs.length && recs[i + 1].level > r.level ? 'project' : r.milestone ? 'milestone' : 'task';
+      const color = r.color || (parent && parent.color) || PALETTE[0];
+      const it = {
+        id: uid(), type, name: r.name,
+        start: toStr(r.s), end: toStr(type === 'milestone' ? r.s : r.e),
+        color, progress: clamp(Math.round(r.progress), 0, 100),
+        parent: parent ? parent.id : null, notes: r.notes,
+      };
+      items.push(it);
+      r.item = it;
+      if (r.srcId) bySrcId.set(r.srcId, it);
+      stack.push({ level: r.level, id: it.id, color });
+    });
+
+    // Dependencies and resources aren't drawn, so keep them readable in the notes.
+    for (const r of recs) {
+      const extra = [];
+      if (r.preds) {
+        const deps = r.preds.split(/[,;]/).map((x) => x.trim()).filter(Boolean).map((tok) => {
+          const m = /^(\d+)\s*(FS|SS|FF|SF)?\s*(?:([+-])\s*(\d+(?:\.\d+)?)\s*([a-z]*))?$/i.exec(tok);
+          if (!m) return tok;
+          const target = bySrcId.get(m[1]);
+          const label = target ? `“${target.name}”` : `#${m[1]}`;
+          const lag = m[3] ? `, ${m[3]}${m[4]} ${m[5] || 'days'}` : '';
+          return `${label} (${DEP_TYPES[(m[2] || 'FS').toUpperCase()]}${lag})`;
+        });
+        extra.push('Depends on: ' + deps.join('; '));
+      }
+      if (r.res) extra.push('Resources: ' + r.res);
+      if (extra.length) r.item.notes = [r.item.notes, ...extra].filter(Boolean).join('\n');
+    }
+
+    let min = Infinity, max = -Infinity;
+    for (const it of items) { min = Math.min(min, toNum(it.start)); max = Math.max(max, toNum(it.end)); }
+    const span = max - min;
+    const zoom = span <= 45 ? 'day' : span <= 270 ? 'week' : span <= 1600 ? 'month' : 'quarter';
+    return normalize({ version: 1, title: options.title || 'Imported plan', settings: { zoom, showColumns: true }, items, markers: [] });
+  }
+
+  /** Parse a file's text as a plan: .gantt/.json, or CSV (by name or content). */
+  function parseFile(text, fileName) {
+    const name = String(fileName || '');
+    const title = name.replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '').replace(/_/g, ' ').trim();
+    const trimmed = String(text || '').replace(/^﻿/, '').trim();
+    if (/\.(csv|tsv|txt)$/i.test(name) || (trimmed && trimmed[0] !== '{')) return fromCsv(text, { title: title || undefined });
+    return normalize(JSON.parse(trimmed));
   }
 
   // ---------------------------------------------------------------------------
@@ -257,6 +443,7 @@ var LocalGantt = (function () {
     // ---- model helpers ------------------------------------------------------
     const byId = (id) => data.items.find((i) => i.id === id) || null;
     const childrenOf = (id) => data.items.filter((i) => i.parent === id);
+    const descendantsOf = (id) => childrenOf(id).flatMap((k) => [k, ...descendantsOf(k.id)]);
     const leftWidth = () =>
       COLS.name + (data.settings.showColumns ? COLS.start + COLS.end + COLS.days + COLS.progress : 0);
     const x = (n) => (n - range.start) * dw;
@@ -275,23 +462,27 @@ var LocalGantt = (function () {
     }
     function progressOf(it) {
       if (it.type !== 'project') return it.progress;
-      const kids = childrenOf(it.id).filter((k) => k.type === 'task');
+      const kids = descendantsOf(it.id).filter((k) => k.type === 'task');
       if (!kids.length) return it.progress;
       let total = 0, done = 0;
       for (const k of kids) { const sp = spanOf(k); const len = sp.e - sp.s + 1; total += len; done += (len * k.progress) / 100; }
       return total ? Math.round((done / total) * 100) : 0;
     }
-    function visibleRows() {
+    function visibleRows(all) {
       const out = [];
-      for (const it of data.items) {
-        if (it.parent) continue;
-        out.push({ it, depth: 0 });
-        if (it.type === 'project' && !it.collapsed) for (const k of childrenOf(it.id)) out.push({ it: k, depth: 1 });
-      }
+      const walk = (parent, depth) => {
+        for (const it of data.items) {
+          if (it.parent !== parent) continue;
+          out.push({ it, depth });
+          if (it.type === 'project' && (all || !it.collapsed)) walk(it.id, depth + 1);
+        }
+      };
+      walk(null, 0);
       return out;
     }
 
     // ---- change handling ------------------------------------------------------
+    const visibleRowsAll = () => visibleRows(true);
     const getData = () => JSON.parse(JSON.stringify(data));
     function emit() { if (opts.onChange) opts.onChange(getData()); }
     function mutate(fn) {
@@ -361,7 +552,7 @@ var LocalGantt = (function () {
     }
     function removeItem(it) {
       mutate(() => {
-        const kill = new Set([it.id, ...childrenOf(it.id).map((k) => k.id)]);
+        const kill = new Set([it.id, ...descendantsOf(it.id).map((k) => k.id)]);
         data.items = data.items.filter((i) => !kill.has(i.id));
         if (kill.has(selectedId)) selectedId = null;
       });
@@ -406,7 +597,7 @@ var LocalGantt = (function () {
       selectedId = it.id;
       mutate(() => {
         data.items.splice(index, 0, it);
-        if (parentItem) parentItem.collapsed = false;
+        for (let p = parentItem; p; p = byId(p.parent)) p.collapsed = false;
       });
       ensureVisible(start);
       const row = [...scrollEl.querySelectorAll('.lg-row')].find((r) => r.dataset.id === it.id);
@@ -768,7 +959,7 @@ var LocalGantt = (function () {
       const sp = spanOf(it);
       const own = reg.get(it.id) || [];
       const targets = [...own];
-      if (mode === 'move' && it.type === 'project') for (const k of childrenOf(it.id)) targets.push(...(reg.get(k.id) || []));
+      if (mode === 'move' && it.type === 'project') for (const k of descendantsOf(it.id)) targets.push(...(reg.get(k.id) || []));
       for (const el of targets) { el._l = parseFloat(el.style.left) || 0; el._w = parseFloat(el.style.width) || 0; }
       const bar = own[0];
       const describe = (s, en) => it.type === 'milestone' ? fmtLong(s) : `${fmtShort(s)} – ${fmtShort(en)} · ${en - s + 1} days`;
@@ -793,7 +984,7 @@ var LocalGantt = (function () {
           mutate(() => {
             if (mode === 'move') {
               shiftItem(it, dd);
-              if (it.type === 'project') for (const k of childrenOf(it.id)) shiftItem(k, dd);
+              if (it.type === 'project') for (const k of descendantsOf(it.id)) shiftItem(k, dd);
             } else if (mode === 'start') {
               it.start = toStr(Math.min(sp.s + dd, sp.e));
             } else {
@@ -895,14 +1086,16 @@ var LocalGantt = (function () {
       const sp = spanOf(it);
       const isProj = it.type === 'project';
       const auto = sp.auto;
-      const kids = childrenOf(it.id).length;
+      const kids = descendantsOf(it.id).length;
 
       const name = inp('text', it.name, { placeholder: 'Name' });
       const typeSel = isProj ? null : E('select', { class: 'lg-input' },
         opt('task', 'Task', it.type), opt('milestone', 'Milestone', it.type));
-      const parentSel = isProj ? null : E('select', { class: 'lg-input' },
-        opt('', '— none —', it.parent || ''),
-        data.items.filter((i) => i.type === 'project').map((p) => opt(p.id, p.name || 'Untitled project', it.parent || '')));
+      const banned = new Set([it.id, ...descendantsOf(it.id).map((k) => k.id)]);
+      const parentSel = E('select', { class: 'lg-input' },
+        opt('', '— none (top level) —', it.parent || ''),
+        visibleRowsAll().filter((r) => r.it.type === 'project' && !banned.has(r.it.id))
+          .map((r) => opt(r.it.id, '\u00a0\u00a0'.repeat(r.depth) + (r.it.name || 'Untitled project'), it.parent || '')));
       const start = inp('date', it.start);
       const end = inp('date', it.end);
       const progress = inp('number', String(it.progress), { min: '0', max: '100', step: '5' });
@@ -926,7 +1119,7 @@ var LocalGantt = (function () {
 
       const body = [
         field('Name', name),
-        typeSel ? E('div', { class: 'lg-field-row' }, field('Type', typeSel), field('Project', parentSel)) : null,
+        E('div', { class: 'lg-field-row' }, typeSel ? field('Type', typeSel) : null, field('Inside project', parentSel)),
         auto
           ? E('div', { class: 'lg-note' }, `Dates follow the ${kids} item(s) in this project: ${fmtLong(sp.s)} – ${fmtLong(sp.e)} (${sp.e - sp.s + 1} days, ${progressOf(it)}% done).`)
           : E('div', { class: 'lg-field-row' }, startField, endField, progField),
@@ -961,7 +1154,7 @@ var LocalGantt = (function () {
             if (type !== 'milestone') it.progress = clamp(Math.round(Number(progress.value)) || 0, 0, 100);
           }
           it.color = color.get();
-          if (parentSel) it.parent = parentSel.value || null;
+          it.parent = parentSel.value || null;
           if (isProj) { it.deadline = d == null ? null : toStr(d); it.deadlineColor = dlColor.get(); }
           it.notes = notes.value;
         });
@@ -1027,6 +1220,8 @@ var LocalGantt = (function () {
       el: rootEl,
       getData,
       setData(d) { data = normalize(d); undoStack = []; redoStack = []; render(); },
+      /** Replace the whole plan as an undoable change (e.g. after an import). */
+      replaceData(d) { const next = normalize(d); selectedId = null; pendingToday = true; mutate(() => { data = next; }); },
       render,
       undo,
       redo,
@@ -1034,7 +1229,7 @@ var LocalGantt = (function () {
     };
   }
 
-  return { create, normalize, sampleData, starterData, blankData, PALETTE };
+  return { create, normalize, fromCsv, parseFile, sampleData, starterData, blankData, PALETTE };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports.LocalGantt = LocalGantt;

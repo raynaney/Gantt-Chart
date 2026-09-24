@@ -11,24 +11,31 @@
     try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (_) { /* storage unavailable */ }
   }
 
-  function openFile() {
+  function loadFile(file) {
+    file.text().then((text) => {
+      try {
+        gantt.replaceData(LocalGantt.parseFile(text, file.name));
+      } catch (e) {
+        alert('Could not open “' + file.name + '”: ' + e.message);
+      }
+    });
+  }
+
+  function pickFile(accept) {
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = '.gantt,.json,application/json';
-    input.onchange = () => {
-      const file = input.files && input.files[0];
-      if (!file) return;
-      file.text().then((text) => {
-        try {
-          gantt.setData(JSON.parse(text));
-          persist(gantt.getData());
-        } catch (e) {
-          alert('Could not open that file: ' + e.message);
-        }
-      });
-    };
+    input.accept = accept;
+    input.onchange = () => { if (input.files && input.files[0]) loadFile(input.files[0]); };
     input.click();
   }
+
+  // Drop a .gantt / .json / .csv file anywhere on the page to open it.
+  document.addEventListener('dragover', (e) => { e.preventDefault(); });
+  document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer && e.dataTransfer.files[0];
+    if (file) loadFile(file);
+  });
 
   function saveFile() {
     const d = gantt.getData();
@@ -49,11 +56,11 @@
     toolbarExtras: [
       { label: 'New', title: 'Start a new, empty plan', onClick: () => {
         if (confirm('Start a new empty plan? The current plan will be replaced (use “Save…” first to keep a copy).')) {
-          gantt.setData(LocalGantt.blankData());
-          persist(gantt.getData());
+          gantt.replaceData(LocalGantt.blankData());
         }
       } },
-      { label: 'Open…', title: 'Open a .gantt / .json file', onClick: openFile },
+      { label: 'Open…', title: 'Open a .gantt or .csv file (you can also drop a file onto the page). Ctrl/Cmd+Z undoes it.', onClick: () => pickFile('.gantt,.json,.csv,text/csv,application/json') },
+      { label: 'Import CSV…', title: 'Import a CSV export from onlinegantt.com (Outline Level, Name, Start, Finish, …). Ctrl/Cmd+Z undoes it.', onClick: () => pickFile('.csv,text/csv') },
       { label: 'Save…', title: 'Download this plan as a .gantt file (works with the Obsidian plugin too)', onClick: saveFile },
       { label: 'Print', title: 'Print or save as PDF', onClick: () => window.print() },
     ],
