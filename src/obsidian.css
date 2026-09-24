@@ -1,0 +1,33 @@
+/* ---------- Obsidian theme bridge ---------- */
+.lg-root.lg-obsidian {
+  --lg-bg: var(--background-primary);
+  --lg-bg-alt: var(--background-secondary);
+  --lg-border: var(--background-modifier-border);
+  --lg-grid: color-mix(in srgb, var(--background-modifier-border) 55%, transparent);
+  --lg-grid-strong: var(--background-modifier-border);
+  --lg-text: var(--text-normal);
+  --lg-muted: var(--text-muted);
+  --lg-accent: var(--interactive-accent);
+  --lg-accent-text: var(--text-on-accent);
+  --lg-hover: var(--background-modifier-hover);
+  --lg-sel: color-mix(in srgb, var(--interactive-accent) 14%, transparent);
+  --lg-weekend: color-mix(in srgb, var(--text-muted) 7%, transparent);
+  --lg-tip-bg: var(--text-normal);
+  --lg-tip-text: var(--background-primary);
+  --lg-font: var(--font-interface);
+}
+.workspace-leaf-content .view-content.lg-view { padding: 0; overflow: hidden; }
+.lg-embed {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 4px 0;
+}
+.lg-error-box {
+  margin: 16px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-error, #e5484d);
+  color: var(--text-error, #e5484d);
+  font-size: 13px;
+}

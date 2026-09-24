@@ -1,0 +1,9 @@
+{
+  "id": "local-gantt",
+  "name": "Local Gantt",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Interactive Gantt charts stored as .gantt files in your vault: projects with deadlines, tasks, milestones and marker lines, with custom colours and drag-to-reschedule.",
+  "author": "raynaney",
+  "isDesktopOnly": false
+}
